@@ -1,133 +1,168 @@
-/* ============================================================
- * ETHERNET BRING-UP — NUCLEO-F411RE + W5500
- * PA1  STATUS LED — solid ON when W5500 responds + link up
- * ============================================================ */
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2026 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+
+/* Includes ------------------------------------------------------------------*/
 #include <stdio.h>
 #include "main.h"
-#include "w5500_port.h"
-#include "wizchip_conf.h"
-#include "socket.h"
+#include "app_bluenrg.h"
+#include "hci.h"
+#include "services.h"
+#include "adc.h"
+#include "pulse_sensor.h"
 
-#define SOCK_TCP0   0
-#define TCP_PORT    5000
+#define UART_TX_BUFFER_SIZE 512
 
+extern uint16_t signal_min;
+extern uint16_t signal_max;
+
+UART_HandleTypeDef huart2;
 
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 
-UART_HandleTypeDef huart2;
+static volatile uint8_t uart_tx_buffer[UART_TX_BUFFER_SIZE];
+static volatile uint16_t tx_head = 0;
+static volatile uint16_t tx_tail = 0;
+static volatile uint8_t tx_busy = 0;
 
+int __io_putchar(int ch) {
+    uint16_t next_head = (tx_head + 1) % UART_TX_BUFFER_SIZE;
 
-int __io_putchar(int ch)
-{
-	HAL_UART_Transmit(&huart2, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+    // Check if buffer is full
+    if (next_head == tx_tail) {
+        return -1; // Buffer overflow
+    }
 
-	return ch;
+    // Add character to buffer (atomic operation)
+    __disable_irq();
+    uart_tx_buffer[tx_head] = (char)ch;
+    tx_head = next_head;
+    __enable_irq();
+
+    // Start transmission if UART is idle
+    if (!tx_busy) {
+        tx_busy = 1;
+        HAL_UART_Transmit_IT(&huart2, (uint8_t *)&uart_tx_buffer[tx_tail], 1);
+    }
+
+    return ch;
 }
 
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART2) {
+        // Move to next character
+        tx_tail = (tx_tail + 1) % UART_TX_BUFFER_SIZE;
 
+        // Continue sending if more data exists
+        if (tx_head != tx_tail) {
+            HAL_UART_Transmit_IT(&huart2, (uint8_t *)&uart_tx_buffer[tx_tail], 1);
+        } else {
+            tx_busy = 0; // Transmission complete
+        }
+    }
+}
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
 int main(void)
 {
+    static uint16_t last_sent_bpm = 0;
+
     HAL_Init();
     SystemClock_Config();
-    MX_USART2_UART_Init();
+
     MX_GPIO_Init();
+    MX_USART2_UART_Init();
+    pulse_sensor_init();
 
-    printf("\r\n========================================\r\n");
-    printf("  NUCLEO-F411RE + W5500 Ethernet Bring-Up\r\n");
-    printf("========================================\r\n\r\n");
+    pa4_adc_init();
+    pa4_adc_start();
 
-    /* ── W5500 init ── */
-    printf("[INIT] Starting W5500 port init...\r\n");
-    w5500_port_init();
-    printf("[INIT] W5500 port init complete.\r\n");
+    printf("STM32 BLE Pulse Sensor Application Start\r\n");
 
-    {
-        uint8_t tx[8] = {2,2,2,2,2,2,2,2};
-        uint8_t rx[8] = {2,2,2,2,2,2,2,2};
-        printf("[INIT] Calling wizchip_init (TX/RX buffer sizes = 2KB each)...\r\n");
-        wizchip_init(tx, rx);
-        printf("[INIT] wizchip_init complete.\r\n");
-    }
-
-    /* ── Set static network info (AFTER wizchip_init) ── */
-    wiz_NetInfo netInfo = {
-        .mac  = {0x00, 0x08, 0xDC, 0x11, 0x22, 0x33},
-        .ip   = {10, 0, 0, 200},
-        .sn   = {255, 255, 255, 0},
-        .gw   = {10, 0, 0, 1},
-        .dns  = {8, 8, 8, 8},
-        .dhcp = NETINFO_STATIC
-    };
-    ctlnetwork(CN_SET_NETINFO, &netInfo);
-    printf("[NET] Static IP: %d.%d.%d.%d / GW: %d.%d.%d.%d\r\n",
-           netInfo.ip[0], netInfo.ip[1], netInfo.ip[2], netInfo.ip[3],
-           netInfo.gw[0], netInfo.gw[1], netInfo.gw[2], netInfo.gw[3]);
-
-    /* ── STATUS LED ON if W5500 chip responds ── */
-    {
-        uint8_t ver = getVERSIONR();
-        printf("[W5500] Chip version register: 0x%02X ", ver);
-        if (ver == 0x04)
-        {
-            printf("(OK - W5500 detected)\r\n");
-            HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET);
-        }
-        else
-        {
-            printf("(FAIL - expected 0x04!)\r\n");
-        }
-    }
-
-    /* ── Step 2: wait for PHY link up ── */
-    printf("[PHY] Waiting for Ethernet link up...\r\n");
-    while (wizphy_getphylink() != PHY_LINK_ON)
-    {
-        /* blocking wait — plug in Ethernet cable */
-    }
-    printf("[PHY] Ethernet link UP!\r\n");
-
-    /* ── Step 3: open TCP socket 0, listen, echo server ── */
-    uint8_t buf[64];
-
-    printf("[TCP] Opening socket 0 on port %d...\r\n", TCP_PORT);
-    socket(SOCK_TCP0, Sn_MR_TCP, TCP_PORT, 0x00);
-    listen(SOCK_TCP0);
-    printf("[TCP] Socket 0 listening on port %d\r\n", TCP_PORT);
+    bluenrg_init();
 
     while (1)
     {
-        uint8_t status = getSn_SR(SOCK_TCP0);
+        /* Process BLE events */
+        bluenrg_process();
 
-        if (status == SOCK_ESTABLISHED)
-        {
-            int32_t len = getSn_RX_RSR(SOCK_TCP0);
-            if (len > 0)
-            {
-                if (len > (int32_t)sizeof(buf))
-                    len = sizeof(buf);
+        // Check for new beats and send BPM
+           if (pulse_sensor_beat_detected()) {
+               uint16_t bpm = pulse_sensor_get_bpm();
 
-                len = recv(SOCK_TCP0, buf, len);
-                if (len > 0)
-                {
-                    printf("[TCP] Echoing %ld bytes\r\n", (long)len);
-                    send(SOCK_TCP0, buf, len);   /* echo back */
-                }
-            }
-        }
-        else if (status == SOCK_CLOSE_WAIT)
-        {
-            printf("[TCP] Socket 0: CLOSE_WAIT — disconnecting\r\n");
-            disconnect(SOCK_TCP0);
-        }
-        else if (status == SOCK_CLOSED)
-        {
-            printf("[TCP] Socket 0: CLOSED — reopening\r\n");
-            socket(SOCK_TCP0, Sn_MR_TCP, TCP_PORT, 0x00);
-            listen(SOCK_TCP0);
-            printf("[TCP] Socket 0 listening on port %d\r\n", TCP_PORT);
-        }
+               if (pulse_sensor_bpm_valid() && bpm != last_sent_bpm) {
+                   printf("Sending BPM: %d\n\r", bpm);
+                   update_bpm_data(&bpm, sizeof(bpm));
+                   last_sent_bpm = bpm;
+               }
+           }
+
+         HAL_Delay(2);
+    }
+
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    /** Configure the main internal regulator output voltage */
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+    /** Initializes the RCC Oscillators according to the specified parameters
+    * in the RCC_OscInitTypeDef structure.
+    */
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+    RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+    RCC_OscInitStruct.PLL.PLLM = 16;
+    RCC_OscInitStruct.PLL.PLLN = 336;
+    RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
+    RCC_OscInitStruct.PLL.PLLQ = 4;
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    /** Initializes the CPU, AHB and APB buses clocks */
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                                  | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
+    {
+        Error_Handler();
     }
 }
 
@@ -156,68 +191,86 @@ static void MX_USART2_UART_Init(void)
     HAL_NVIC_EnableIRQ(USART2_IRQn);
 }
 
+/**
+  * @brief GPIO Initialization Function
+  * @param None
+  * @retval None
+  */
 static void MX_GPIO_Init(void)
 {
     GPIO_InitTypeDef GPIO_InitStruct = {0};
 
+    /* GPIO Ports Clock Enable */
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOH_CLK_ENABLE();
     __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
 
-    /* PA1 — STATUS LED, OFF initially */
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
+    /* Configure GPIO pin Output Level */
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1 | LD2_Pin | GPIO_PIN_8, GPIO_PIN_RESET);
 
-    GPIO_InitStruct.Pin   = GPIO_PIN_1;
-    GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull  = GPIO_NOPULL;
+    /* Configure GPIO pin : B1_Pin */
+    GPIO_InitStruct.Pin = B1_Pin;
+    GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(B1_GPIO_Port, &GPIO_InitStruct);
+
+    /* Configure GPIO pin : PA0 */
+    GPIO_InitStruct.Pin = GPIO_PIN_0;
+    GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    /* Configure GPIO pins : PA1 LD2_Pin PA8 */
+    GPIO_InitStruct.Pin = GPIO_PIN_1 | LD2_Pin | GPIO_PIN_8;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    /* EXTI interrupt init*/
+    HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
+    HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 }
 
-void SystemClock_Config(void)
-{
-    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
-    __HAL_RCC_PWR_CLK_ENABLE();
-    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
-
-    RCC_OscInitStruct.OscillatorType      = RCC_OSCILLATORTYPE_HSE;
-    RCC_OscInitStruct.HSEState            = RCC_HSE_ON;
-    RCC_OscInitStruct.PLL.PLLState        = RCC_PLL_ON;
-    RCC_OscInitStruct.PLL.PLLSource       = RCC_PLLSOURCE_HSE;
-    RCC_OscInitStruct.PLL.PLLM            = 4;
-    RCC_OscInitStruct.PLL.PLLN            = 96;
-    RCC_OscInitStruct.PLL.PLLP            = RCC_PLLP_DIV2;
-    RCC_OscInitStruct.PLL.PLLQ            = 4;
-    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-        Error_Handler();
-
-    RCC_ClkInitStruct.ClockType      = RCC_CLOCKTYPE_HCLK
-                                     | RCC_CLOCKTYPE_SYSCLK
-                                     | RCC_CLOCKTYPE_PCLK1
-                                     | RCC_CLOCKTYPE_PCLK2;
-    RCC_ClkInitStruct.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
-    RCC_ClkInitStruct.AHBCLKDivider  = RCC_SYSCLK_DIV1;
-    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-
-    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
-        Error_Handler();
-}
 
 void USART2_IRQHandler(void)
 {
 	HAL_UART_IRQHandler(&huart2);
 }
 
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
 void Error_Handler(void)
 {
+    /* USER CODE BEGIN Error_Handler_Debug */
+    /* User can add his own implementation to report the HAL error return state */
     __disable_irq();
-    while (1) {}
+    while (1)
+    {
+    }
+    /* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-    (void)file; (void)line;
+    /* USER CODE BEGIN 6 */
+    /* User can add his own implementation to report the file name and line number,
+       ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+    /* USER CODE END 6 */
 }
-#endif
+#endif /* USE_FULL_ASSERT */
